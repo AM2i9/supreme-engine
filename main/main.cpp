@@ -12,7 +12,7 @@ static espp::Logger logger({.tag = "Blink", .level = espp::Logger::Verbosity::DE
 
 static void blink_led(void) {
     /* Set the GPIO level according to the state (LOW or HIGH)*/
-    logger.info("{}", gpio_set_level(BLINK_GPIO, s_led_state));
+    gpio_set_level(BLINK_GPIO, s_led_state);
 }
 
 extern "C" void app_main(void) {
@@ -25,6 +25,7 @@ extern "C" void app_main(void) {
   // also print in the main thread
    while (1) {
     logger.info("Turning the LED {}!", s_led_state == true ? "ON" : "OFF");
+    logger.info("blink_state:{}", s_led_state);
     blink_led();
     /* Toggle the LED state */
     s_led_state = !s_led_state;
