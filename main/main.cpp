@@ -7,6 +7,7 @@
 #include <esp_err.h>
 #include "interrupt.hpp"
 #include "led.hpp"
+#include <atomic>
 
 #define ENC_INTERRUPT_PIN GPIO_NUM_14
 #define MOTOR_GPIO 15
@@ -19,8 +20,8 @@ static espp::Logger logger({.tag = "ESP32", .level = espp::Logger::Verbosity::DE
 static int adc_raw[2][10];
 
 static auto last = std::chrono::high_resolution_clock::now();
-static float rpm = 0.0;
-static int counts = 0;
+static float rpm{0.0f};
+static std::atomic<int> counts{0};
 
 // Set motor output speed
 // speed - Range of [0.0,1.0], 1.0 being full speed
@@ -53,9 +54,9 @@ extern "C" void app_main(void) {
     auto now = std::chrono::high_resolution_clock::now();
     auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(now - last).count();
     last = now;
-    counts++;
-    float speed = 1000000.0/ ((float) elapsed);
-    rpm = (speed/4.0)*60;
+    counts.fetch_add(1);
+    float speed = 1000000.0f / ((float) elapsed);
+    rpm = ((speed / 4.0f) * 60.0f);
   };
 
   espp::Interrupt::PinConfig enc_inter_pinconfig = {
@@ -104,17 +105,32 @@ extern "C" void app_main(void) {
   };
   ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel));
 
-  // Main loop
+  // PI controller parameters
+  const std::chrono::milliseconds sample_period(100); // 100 ms loop
+  float kp = 0.0012f; // proportional gain (tune as needed)
+  float ki = 0.0008f; // integral gain (tune as needed)
+  float integrator = 0.0f;
+  const float integrator_limit = 10000.0f;
+  float target_rpm = 100.0f; // desired RPM (adjust as needed)
 
   while (1) {
     ESP_ERROR_CHECK(adc_oneshot_read(adc1_handle, ADC_CHANNEL_6, &adc_raw[0][0]));
-    // logger.info("ADC1_CH6: {}", adc_raw[0][0]);
 
-    set_motor_speed(1.0);
-    std::this_thread::sleep_for(1s);
+    float measured_rpm = rpm;
+    float error = target_rpm - measured_rpm;
+    // integrate error (simple forward Euler)
+    integrator += error * (sample_period.count() / 1000.0f);
+    if (integrator > integrator_limit) integrator = integrator_limit;
+    if (integrator < -integrator_limit) integrator = -integrator_limit;
 
+    float output = kp * error + ki * integrator; // controller output in RPM->duty space
+    if (output > 1.0f) output = 1.0f;
+    if (output < 0.0f) output = 0.0f;
 
-    logger.info("RPM: {}", rpm);
-    std::this_thread::sleep_for(10ms);
+    set_motor_speed(output);
+
+    logger.info("RPM: {}, Out: {}, Count: {}", measured_rpm, output, counts.load());
+
+    std::this_thread::sleep_for(sample_period);
   }
 }
