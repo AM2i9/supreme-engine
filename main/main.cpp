@@ -15,6 +15,11 @@
 #define MOTOR_GPIO 15
 #define SMOOTH_SIZE 50
 
+#define Y_MIN 1150
+#define Y_MAX 2500
+#define X_MIN 1150
+#define X_MAX 2500
+
 #define ADC_ATTEN ADC_ATTEN_DB_12
 
 using namespace std::chrono_literals;
@@ -28,6 +33,11 @@ static float rpm{0.0f};
 
 static double weights[SMOOTH_SIZE];
 static std::vector<double> rpm_buffer;
+
+template <typename T,typename M> T deadzone(T val, M deadzone) {
+    if (val > deadzone || val < -deadzone) return val;
+    return (T)0;
+}
 
 template <typename T> T map_range(T value, T a_start, T a_end, T b_start, T b_end) {
   return (value - a_start) * (b_end - b_start) / (a_end - a_start) + b_start;
@@ -175,8 +185,22 @@ extern "C" void app_main(void) {
   bool button_pressed = false;
 
   while (1) {
-    ESP_ERROR_CHECK(adc_oneshot_read(adc2_handle, ADC_CHANNEL_4, &adc_raw[0][0]));
-    ESP_ERROR_CHECK(adc_oneshot_read(adc2_handle, ADC_CHANNEL_8, &adc_raw[0][1]));
+
+    // joystick stuff
+
+    int adc_ch4;
+    int adc_ch8;
+
+    ESP_ERROR_CHECK(adc_oneshot_read(adc2_handle, ADC_CHANNEL_4, &adc_ch4));
+    ESP_ERROR_CHECK(adc_oneshot_read(adc2_handle, ADC_CHANNEL_8, &adc_ch8));
+
+    double y_axis = map_range(adc_ch4, Y_MIN, Y_MAX, -4096, 4096)/4096.0;
+    double x_axis = map_range(adc_ch8, X_MIN, X_MAX, -4096, 4096)/4096.0;
+
+    y_axis = deadzone(y_axis, 0.10);
+    y_axis = deadzone(y_axis, 0.10);
+
+    // spinner stuff
 
     rpm = ((speed / ENC_CPR) * 60.0f);
 
@@ -217,7 +241,7 @@ extern "C" void app_main(void) {
       button_pressed = false;
     }
 
-    logger.info("Setpoint: {}, RAW_RPM: {}, RPM: {}, Out: {}, output_rpm: {}, axisone: {}, axistwo: {}", target_rpm, rpm, measured_rpm, output, output * 1600.0, adc_raw[0][0], adc_raw[0][1]);
+    logger.info("Setpoint: {}, RAW_RPM: {}, RPM: {}, Out: {}, output_rpm: {}, yaxis: {:.2f}, yaxisraw: {}", target_rpm, rpm, measured_rpm, output, output * 1600.0, y_axis, adc_ch4);
 
     std::this_thread::sleep_for(sample_period);
   }
