@@ -11,8 +11,10 @@ import serial.tools
 from threading import Thread, Lock
 import dearpygui.dearpygui as dpg
 import serial.tools.list_ports
+import csv
+from itertools import zip_longest
 
-MAX_DEQUE = 600
+MAX_DEQUE = 10000
 VAR_REGEX = r"([a-zA-Z_-]*?):\s?((?:false)|(?:true)|(?:\d*(?:\.\d*)?))"
 
 tlock = Lock()
@@ -92,6 +94,19 @@ def _plot_var(var_name):
     dpg.fit_axis_data(yaxes_id)
     graphed.append(var_name)
 
+def _export_plot():
+    with open('data_out.csv', 'w', newline='') as csvfile:
+        writer = csv.writer(csvfile)
+
+        writer.writerow(['Time', *graphed] )
+
+        time, _ = zip(*list(published_vals[graphed[0]]['history']))
+        gaph_values = [list(zip(*list(published_vals[v]['history'])))[1] for v in graphed]
+
+        rows = list(zip_longest(time, *gaph_values, fillvalue=None))
+        # print(rows)
+        writer.writerows(rows)
+
 def _update_plot():
     while True:
         if ser is None:
@@ -149,16 +164,19 @@ def _dev_log_thread():
                 buf = ser.readline()
             except serial.SerialTimeoutException, TypeError:
                 continue
-            msg = buf.decode()
-            for var in re.findall(VAR_REGEX, msg):
-                if var[1] == 'false':
-                    value = '0'
-                elif var[1] == 'true':
-                    value = '1'
-                else:
-                    value = var[1]
-                _log_var(var[0], value)
-            _log_msg(msg)
+            try:
+                msg = buf.decode()
+                for var in re.findall(VAR_REGEX, msg):
+                    if var[1] == 'false':
+                        value = '0'
+                    elif var[1] == 'true':
+                        value = '1'
+                    else:
+                        value = var[1]
+                    _log_var(var[0], value)
+                _log_msg(msg)
+            except:
+                pass
         time.sleep(0.001)
 
 # Serial Info
@@ -205,6 +223,7 @@ yaxes_id = dpg.generate_uuid()
 
 # Graph values
 with dpg.window(label="Graph", height=550, width=1000, pos=(10, 440)):
+    dpg.add_button(label="Export", callback=_export_plot)
     with dpg.plot(label="Line Series", width=-1, height=-25, tag=plot_id):
         dpg.add_plot_legend()
 

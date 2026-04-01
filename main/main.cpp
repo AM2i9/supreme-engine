@@ -9,8 +9,11 @@
 #include "led.hpp"
 #include <atomic>
 
+#define BUTTON_PIN GPIO_NUM_18
 #define ENC_INTERRUPT_PIN GPIO_NUM_14
+#define ENC_CPR 8.0
 #define MOTOR_GPIO 15
+#define SMOOTH_SIZE 50
 
 #define ADC_ATTEN ADC_ATTEN_DB_12
 
@@ -20,8 +23,15 @@ static espp::Logger logger({.tag = "ESP32", .level = espp::Logger::Verbosity::DE
 static int adc_raw[2][10];
 
 static auto last = std::chrono::high_resolution_clock::now();
+static float speed{0.0f};
 static float rpm{0.0f};
-static std::atomic<int> counts{0};
+
+static double weights[SMOOTH_SIZE];
+static std::vector<double> rpm_buffer;
+
+template <typename T> T map_range(T value, T a_start, T a_end, T b_start, T b_end) {
+  return (value - a_start) * (b_end - b_start) / (a_end - a_start) + b_start;
+}
 
 // Set motor output speed
 // speed - Range of [0.0,1.0], 1.0 being full speed
@@ -31,21 +41,69 @@ void set_motor_speed(float speed) {
     ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_5));
 }
 
+// Math is scary
+void compute_weights() {
+  double sigma = 8;
+  double sum = 0;
+
+  for (int i=0;i<SMOOTH_SIZE;i++) {
+    weights[i] = std::exp(-(i * i) / (2 * std::pow(sigma, 2)));
+    sum += weights[i];
+  }
+
+  for (size_t i = 0; i < SMOOTH_SIZE; ++i) {
+    weights[i] /= sum;
+  }
+}
+
+// Function to take in new sample, smooth the data using previous samples
+// then return the most recent datapoint but smoothed
+// smooth
+double smooth_single(double sample) {
+  if (rpm_buffer.size() >= SMOOTH_SIZE) {
+    // remove first element of array if window too large
+    rpm_buffer.erase(rpm_buffer.begin());
+  }
+  rpm_buffer.push_back(sample); // add new sample to end of array
+  
+  double result = 0.0;
+  double weightSum = 0.0;
+
+  // Apply weights
+  for (size_t i = 0; i < rpm_buffer.size(); i++) {
+    size_t rev_i = rpm_buffer.size() - 1 - i;
+    result += weights[i] * rpm_buffer[rev_i];
+    weightSum += weights[i];
+  }
+
+  // logger.info("buf: {} | result: {} | weightSum: {}", rpm_buffer, result, weightSum);
+
+  return (weightSum > 0.0) ? result / weightSum : sample;
+}
+
+// MAIN STUFF =-=-=-=-=--=-
+
 extern "C" void app_main(void) {
 
-  // ADC setup
-  adc_oneshot_unit_handle_t adc1_handle;
-  adc_oneshot_unit_init_cfg_t init_config1 = {
-    .unit_id = ADC_UNIT_1,
-  };
-  ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config1, &adc1_handle));
+  // The button
+  ESP_ERROR_CHECK(gpio_input_enable(BUTTON_PIN));
+  ESP_ERROR_CHECK(gpio_set_pull_mode(BUTTON_PIN, GPIO_PULLDOWN_ONLY));
+
+  // ADC configuration
 
   adc_oneshot_chan_cfg_t config = {
     .atten = ADC_ATTEN,
-    .bitwidth = ADC_BITWIDTH_DEFAULT,
+    .bitwidth = ADC_BITWIDTH_12,
   };
 
-  ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, ADC_CHANNEL_6, &config));
+  adc_oneshot_unit_handle_t adc2_handle;
+  adc_oneshot_unit_init_cfg_t init_config2 = {
+    .unit_id = ADC_UNIT_2,
+  };
+  ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config2, &adc2_handle));
+
+  ESP_ERROR_CHECK(adc_oneshot_config_channel(adc2_handle, ADC_CHANNEL_8, &config));
+  ESP_ERROR_CHECK(adc_oneshot_config_channel(adc2_handle, ADC_CHANNEL_4, &config));
 
 
   // Encoder interrupt stuff
@@ -54,16 +112,14 @@ extern "C" void app_main(void) {
     auto now = std::chrono::high_resolution_clock::now();
     auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(now - last).count();
     last = now;
-    counts.fetch_add(1);
-    float speed = 1000000.0f / ((float) elapsed);
-    rpm = ((speed / 4.0f) * 60.0f);
+    speed = 1000000.0f / ((float) elapsed);
   };
 
   espp::Interrupt::PinConfig enc_inter_pinconfig = {
       .gpio_num = ENC_INTERRUPT_PIN,
       .callback = callback,
       .active_level = espp::Interrupt::ActiveLevel::HIGH,
-      .interrupt_type = espp::Interrupt::Type::RISING_EDGE,
+      .interrupt_type = espp::Interrupt::Type::ANY_EDGE,
       .pullup_enabled = false,
       .pulldown_enabled = true,
       // flexible filter requiring configuration (default is provided as 5us
@@ -105,31 +161,63 @@ extern "C" void app_main(void) {
   };
   ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel));
 
+  // Compute weights for smoothing
+  compute_weights();
+
   // PI controller parameters
-  const std::chrono::milliseconds sample_period(100); // 100 ms loop
-  float kp = 0.0012f; // proportional gain (tune as needed)
-  float ki = 0.0008f; // integral gain (tune as needed)
+  const std::chrono::milliseconds sample_period(50); // 100 ms loop
+  float kp = 0.0003f; // proportional gain (tune as needed)
+  float ki = 0.0009f; // integral gain (tune as needed)
   float integrator = 0.0f;
-  const float integrator_limit = 10000.0f;
-  float target_rpm = 100.0f; // desired RPM (adjust as needed)
+  const float integrator_limit = 1000.0f;
+  float target_rpm = 500.0f; // desired RPM (adjust as needed)
+
+  bool button_pressed = false;
 
   while (1) {
-    ESP_ERROR_CHECK(adc_oneshot_read(adc1_handle, ADC_CHANNEL_6, &adc_raw[0][0]));
+    ESP_ERROR_CHECK(adc_oneshot_read(adc2_handle, ADC_CHANNEL_4, &adc_raw[0][0]));
+    ESP_ERROR_CHECK(adc_oneshot_read(adc2_handle, ADC_CHANNEL_8, &adc_raw[0][1]));
 
-    float measured_rpm = rpm;
+    rpm = ((speed / ENC_CPR) * 60.0f);
+
+    float measured_rpm = smooth_single(rpm);
     float error = target_rpm - measured_rpm;
     // integrate error (simple forward Euler)
     integrator += error * (sample_period.count() / 1000.0f);
     if (integrator > integrator_limit) integrator = integrator_limit;
     if (integrator < -integrator_limit) integrator = -integrator_limit;
 
-    float output = kp * error + ki * integrator; // controller output in RPM->duty space
+    float output = (kp * error) + (ki * integrator); // controller output in RPM->duty space
     if (output > 1.0f) output = 1.0f;
     if (output < 0.0f) output = 0.0f;
 
+    // overcome static torque
+    // basically map the output of the controller to above the output range needed to get the motor moving
+    output = (output * (1.0 - 0.18)) + 0.18;
+
     set_motor_speed(output);
 
-    logger.info("RPM: {}, Out: {}, Count: {}", measured_rpm, output, counts.load());
+    // Set so code only runs when button is first pressed and doesn't loop while pressed
+    // can probably be replaced with an interupt if need bee
+    if (gpio_get_level(BUTTON_PIN) && !button_pressed) {
+      button_pressed = true;
+      
+      // setpoint steps
+      if (target_rpm == 0.0) {
+        target_rpm = 500.0;
+      } else if (target_rpm == 500.0) {
+        target_rpm = 750.0;
+      }else if (target_rpm == 750.0) {
+        target_rpm = 1400;
+      } else if (target_rpm == 1400) {
+        target_rpm = 0.0;
+      }
+
+    } else if (!gpio_get_level(BUTTON_PIN) && button_pressed){
+      button_pressed = false;
+    }
+
+    logger.info("Setpoint: {}, RAW_RPM: {}, RPM: {}, Out: {}, output_rpm: {}, axisone: {}, axistwo: {}", target_rpm, rpm, measured_rpm, output, output * 1600.0, adc_raw[0][0], adc_raw[0][1]);
 
     std::this_thread::sleep_for(sample_period);
   }
