@@ -17,3 +17,4 @@ dependencies:
   espp/task: '>=1.0'
   espp/interrupt: '>=1.0'
   espp/led: '>=1.0'
+  espp/wifi: '>=1.0'
