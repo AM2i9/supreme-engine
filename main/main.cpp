@@ -52,7 +52,7 @@ float kp = 0.0003f; // proportional gain (tune as needed)
 float ki = 0.0009f; // integral gain (tune as needed)
 float integrator = 0.0f;
 const float integrator_limit = 1000.0f;
-std::atomic<float> target_rpm = 0.0f; // desired RPM (adjust as needed)
+uint16_t target_rpm = 0.0f; // desired RPM (adjust as needed)
 
 static espp::Logger logger({.tag = "ESP32", .level = espp::Logger::Verbosity::DEBUG});
 
@@ -68,13 +68,14 @@ int adc_ch8;
 
 uint16_t y_axis;
 uint16_t x_axis;
+std::atomic<uint8_t> button_presses = 0;
 
 httpd_handle_t server;
 httpd_config_t config;
 
-template <typename T,typename M> T deadzone(T val, M deadzone) {
-    if (val > deadzone || val < -deadzone) return val;
-    return (T)0;
+template <typename T,typename M> T deadzone(T val, M deadzone, M zero) {
+    if (val - zero > deadzone || val - zero < -deadzone) return val;
+    return (T)zero;
 }
 
 template <typename T> T map_range(T value, T a_start, T a_end, T b_start, T b_end) {
@@ -173,19 +174,32 @@ static esp_err_t ws_handler(httpd_req_t *req) {
   }
   //! STuff needs to happen here or something
   // future self, you may do that for me if you would :)
+  // did it :)
   // logger.info("Packet type: {}", ws_pkt.type);
   if (ws_pkt.type == HTTPD_WS_TYPE_BINARY &&
     ws_pkt.payload != NULL) {
     // logger.info("got packet: {}", ws_pkt.payload[1]);
     if (ws_pkt.payload[0] == 0) {
       // logger.info("requested data!!!");
-      uint8_t return_payload[4];
+      uint8_t return_payload[5];
       return_payload[0] = (uint8_t) x_axis & 0x00FF;
       return_payload[1] = (uint8_t) ((x_axis & 0xFF00) >> 8);
       return_payload[2] = (uint8_t) y_axis & 0x00FF;
       return_payload[3] = (uint8_t) ((y_axis & 0xFF00) >> 8);
+      return_payload[4] = button_presses.load();
       ws_pkt.payload = return_payload;
       ws_pkt.len = sizeof(return_payload);
+
+      // there is 100% a race condition here
+      // but it makes the button randomly not work
+      // and that is funny
+      // so it's staying
+      // if (button_presses.load() > 0) {
+      //   button_presses.store(0);
+      // }
+    } else if (ws_pkt.payload[0] == 1) {
+      // we are getting a new set speed
+      target_rpm = ws_pkt.payload[1] + (ws_pkt.payload[2] << 8);
     }
   }
 
@@ -337,11 +351,11 @@ extern "C" void app_main(void) {
     rpm = ((speed / ENC_CPR) * 60.0f);
 
     float measured_rpm = smooth_single(rpm);
-    float error = target_rpm.load() - measured_rpm;
+    float error = target_rpm - measured_rpm;
     // integrate error (simple forward Euler)
     integrator += error * (sample_period.count() / 1000.0f);
     if (integrator > integrator_limit) integrator = integrator_limit;
-    if (integrator < -integrator_limit) integrator = -integrator_limit;
+    if (integrator < 0) integrator = 0;
 
     float output = (kp * error) + (ki * integrator); // controller output in RPM->duty space
     if (output > 1.0f) output = 1.0f;
@@ -380,30 +394,29 @@ extern "C" void app_main(void) {
     y_axis = map_range(adc_ch4, Y_MIN, Y_MAX, 0, 65535);
     x_axis = map_range(adc_ch8, X_MIN, X_MAX, 0, 65535);
 
-    // y_axis = deadzone(y_axis, 0.10);
-    // y_axis = deadzone(y_axis, 0.10);
+    // really quick and lazy 5% deadzone
+    if (y_axis > (32767 + 3276) || y_axis < (32767 - 3276)) {
+      y_axis = 32767;
+    }
+
+    if (x_axis > (32767 + 3276) || x_axis < (32767 - 3276)) {
+      x_axis = 32767;
+    }
 
     // Set so code only runs when button is first pressed and doesn't loop while pressed
     // can probably be replaced with an interupt if need bee
     if (gpio_get_level(BUTTON_PIN) && !button_pressed) {
       button_pressed = true;
-      
-      // setpoint steps
-      if (target_rpm == 0.0) {
-        target_rpm = 500.0;
-      } else if (target_rpm == 500.0) {
-        target_rpm = 750.0;
-      }else if (target_rpm == 750.0) {
-        target_rpm = 1400;
-      } else if (target_rpm == 1400) {
-        target_rpm = 0.0;
-      }
+      button_presses.fetch_add(1);
+      logger.info("button");
 
     } else if (!gpio_get_level(BUTTON_PIN) && button_pressed){
       button_pressed = false;
     }
 
-    logger.info("yaxis: {}, xaxis: {}", y_axis, x_axis);
+    // logger.info("target_rpm: {}", target_rpm);
+    // logger.info("yaxis: {}, xaxis: {}", y_axis, x_axis);
+    // logger.info("{}", integrator);
 
     std::this_thread::sleep_for(10ms);
   }
